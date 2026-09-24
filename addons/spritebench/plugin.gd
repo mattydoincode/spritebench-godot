@@ -1,0 +1,1056 @@
+@tool
+extends EditorPlugin
+
+const Credentials := preload("credentials.gd")
+const Hasher := preload("hasher.gd")
+const ApiScript := preload("api.gd")
+const InspectorScript := preload("inspector.gd")
+
+var _api: Node
+var _inspector: EditorInspectorPlugin
+var _dock: Control
+var _base_url: LineEdit
+var _pat: LineEdit
+var _project_id: LineEdit
+var _output_dir: LineEdit
+var _status: Label
+var _log: TextEdit
+var _check_btn: Button
+var _sync_btn: Button
+var _syncing := false
+var _sync_queued := false
+var _draining := false
+var _reimport_pending := 0
+
+
+func _enter_tree() -> void:
+	Credentials.ensure_registered()
+	_api = ApiScript.new()
+	add_child(_api)
+	_inspector = InspectorScript.new()
+	_inspector.slot_changed.connect(_request_sync)
+	add_inspector_plugin(_inspector)
+	add_custom_type("SpriteBenchItem", "Resource", preload("spritebench_item.gd"), null)
+	add_custom_type("SpriteBenchSet", "Resource", preload("spritebench_set.gd"), null)
+	_dock = _build_dock()
+	add_control_to_dock(DOCK_SLOT_LEFT_UR, _dock)
+	_hook_filesystem()
+	_load_fields()
+
+
+func _exit_tree() -> void:
+	_set_busy(false)
+	_sync_queued = false
+	if _inspector.slot_changed.is_connected(_request_sync):
+		_inspector.slot_changed.disconnect(_request_sync)
+	remove_inspector_plugin(_inspector)
+	remove_custom_type("SpriteBenchSet")
+	remove_custom_type("SpriteBenchItem")
+	remove_control_from_docks(_dock)
+	_dock.free()
+	_dock = null
+	_unhook_filesystem()
+	_api.queue_free()
+	_api = null
+
+
+func _save_external_data() -> void:
+	if not Credentials.is_configured():
+		return
+	_request_sync()
+
+
+func _request_sync() -> void:
+	if not Credentials.is_configured():
+		_set_status("Need a PAT and project id.")
+		return
+	_sync_queued = true
+	if _draining or _syncing:
+		return
+	_draining = true
+	var tree := get_tree()
+	if tree:
+		await tree.process_frame
+	if not is_inside_tree():
+		_draining = false
+		return
+	while _sync_queued:
+		_sync_queued = false
+		await _sync()
+	_draining = false
+
+
+func _get_plugin_name() -> String:
+	return "SpriteBench"
+
+
+func _build_dock() -> Control:
+	var root := MarginContainer.new()
+	root.name = "SpriteBench"
+	root.add_theme_constant_override("margin_left", 8)
+	root.add_theme_constant_override("margin_right", 8)
+	root.add_theme_constant_override("margin_top", 8)
+	root.add_theme_constant_override("margin_bottom", 8)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	root.add_child(col)
+
+	_base_url = _add_field(col, "API URL")
+	_pat = _add_field(col, "Personal access token")
+	_pat.secret = true
+	_project_id = _add_field(col, "Project ID")
+	_output_dir = _add_field(col, "Output folder")
+
+	var buttons := HBoxContainer.new()
+	_check_btn = Button.new()
+	_check_btn.text = "Check"
+	_check_btn.pressed.connect(_check)
+	_sync_btn = Button.new()
+	_sync_btn.text = "Sync"
+	_sync_btn.pressed.connect(_sync)
+	buttons.add_child(_check_btn)
+	buttons.add_child(_sync_btn)
+	col.add_child(buttons)
+
+	_status = Label.new()
+	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_status.text = "Paste a PAT from SpriteBench Settings."
+	col.add_child(_status)
+
+	_log = TextEdit.new()
+	_log.editable = false
+	_log.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	_log.custom_minimum_size = Vector2(0, 180)
+	_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	col.add_child(_log)
+	return root
+
+
+func _add_field(parent: VBoxContainer, title: String) -> LineEdit:
+	var label := Label.new()
+	label.text = title
+	parent.add_child(label)
+	var edit := LineEdit.new()
+	parent.add_child(edit)
+	return edit
+
+
+func _load_fields() -> void:
+	_base_url.text = Credentials.base_url()
+	_pat.text = Credentials.pat()
+	_project_id.text = Credentials.project_id()
+	_output_dir.text = Credentials.output_dir()
+
+
+func _save_fields() -> void:
+	Credentials.set_base_url(_base_url.text)
+	Credentials.set_pat(_pat.text)
+	Credentials.set_project_id(_project_id.text)
+	Credentials.set_output_dir(_output_dir.text)
+	_load_fields()
+
+
+func _set_busy(busy: bool) -> void:
+	_syncing = busy
+	if _check_btn:
+		_check_btn.disabled = busy
+	if _sync_btn:
+		_sync_btn.disabled = busy
+	var tree := get_tree()
+	if tree == null:
+		return
+	if busy:
+		tree.set_meta("spritebench_busy", true)
+	elif tree.has_meta("spritebench_busy"):
+		tree.remove_meta("spritebench_busy")
+
+
+func _set_status(text: String) -> void:
+	_status.text = text
+
+
+func _log_line(text: String) -> void:
+	if _log.text.is_empty():
+		_log.text = text
+	else:
+		_log.text += "\n" + text
+	_log.scroll_vertical = _log.get_line_count()
+
+
+func _check() -> void:
+	if _syncing:
+		return
+	_save_fields()
+	_set_busy(true)
+	_log.text = ""
+	_set_status("Checking…")
+	var me: Dictionary = await _api.get_json("/api/v1/me")
+	if not me.ok:
+		_set_status(me.error)
+		_set_busy(false)
+		return
+	var user: Dictionary = me.data.get("user", {})
+	var who := str(user.get("email", user.get("name", "signed in")))
+	var projects: Dictionary = await _api.get_json("/api/v1/projects")
+	if not projects.ok:
+		_set_status("%s. %s" % [who, projects.error])
+		_set_busy(false)
+		return
+	var project_id := Credentials.project_id()
+	var name := ""
+	for project in projects.data.get("projects", []):
+		if str(project.get("id", "")) == project_id:
+			name = str(project.get("name", ""))
+			break
+	if project_id.is_empty():
+		_set_status("%s. Set a project id (Engine panel in SpriteBench)." % who)
+	elif name.is_empty():
+		_set_status("%s. Project %s is not in this account." % [who, project_id])
+	else:
+		_set_status("%s · %s" % [who, name])
+	_set_busy(false)
+
+
+func _sync() -> void:
+	if _syncing:
+		return
+	_save_fields()
+	if not Credentials.is_configured():
+		_set_status("Need a PAT and project id.")
+		return
+	_set_busy(true)
+	_log.text = ""
+	_set_status("Syncing…")
+
+	var slots := _collect_slots()
+	var catalog := await _push_catalog(slots)
+	if catalog.is_empty():
+		_set_busy(false)
+		return
+
+	_report_catalog(catalog)
+	var pulled := await _pull_and_write(slots)
+	if pulled < 0:
+		_set_busy(false)
+		return
+
+	if pulled > 0:
+		slots = _collect_slots()
+		catalog = await _push_catalog(slots)
+		if catalog.is_empty():
+			_set_busy(false)
+			return
+
+	var filled := _fill_missing_textures(_collect_slots())
+	_set_status("Synced %s slots, pulled %s." % [slots.size(), pulled])
+	if filled > 0:
+		_log_line("assigned %s on-disk textures" % filled)
+	_set_busy(false)
+
+
+func _push_catalog(slots: Array[Dictionary]) -> Array:
+	var payload: Array = []
+	for slot in slots:
+		payload.append({
+			"id": slot.id,
+			"kind": slot.kind,
+			"intent": slot.intent,
+			"label": slot.label,
+			"path": slot.path,
+			"localHash": slot.localHash,
+		})
+	var response: Dictionary = await _api.post_json(
+		"/api/v1/projects/%s/slots" % Credentials.project_id(),
+		{"slots": payload}
+	)
+	if not response.ok:
+		_set_status(response.error)
+		_log_line(response.error)
+		return []
+	var rows: Array = response.data.get("slots", [])
+	return rows
+
+
+func _report_catalog(rows: Array) -> void:
+	var edited := 0
+	var conflicts := 0
+	for row in rows:
+		var status := str(row.get("status", ""))
+		var label := str(row.get("label", row.get("id", "")))
+		if status == "edited_in_godot":
+			edited += 1
+			_log_line("edited in Godot: %s" % label)
+		elif status == "conflict":
+			conflicts += 1
+			_log_line("conflict: %s" % label)
+	_log_line("catalog %s slots" % rows.size())
+
+
+func _pull_and_write(local_slots: Array[Dictionary]) -> int:
+	var by_id := {}
+	for slot in local_slots:
+		by_id[slot.id] = slot
+	var response: Dictionary = await _api.get_json(
+		"/api/v1/projects/%s/slots/pull" % Credentials.project_id()
+	)
+	if not response.ok:
+		_set_status(response.error)
+		_log_line(response.error)
+		return -1
+	var pending: Array[Dictionary] = []
+	var paths := PackedStringArray()
+	for item in response.data.get("slots", []):
+		var id := str(item.get("id", ""))
+		var local: Dictionary = by_id.get(id, {})
+		var staged := await _stage_slot(item, local)
+		if staged.is_empty():
+			continue
+		pending.append(staged)
+		for path in staged.paths:
+			paths.append(path)
+	await _import_paths(paths)
+	var pulled := 0
+	for row in pending:
+		if _commit_slot(row):
+			pulled += 1
+	return pulled
+
+
+func _stage_slot(item: Dictionary, local: Dictionary) -> Dictionary:
+	var bundle: Variant = item.get("bundle", {})
+	if typeof(bundle) == TYPE_DICTIONARY and not (bundle as Dictionary).is_empty():
+		return await _stage_bundle(item, local, bundle as Dictionary)
+
+	var id := str(item.get("id", ""))
+	var url := str(item.get("url", ""))
+	var remote_hash := str(item.get("remoteHash", ""))
+	var dest := str(item.get("godotPath", ""))
+	if dest.is_empty() or not dest.begins_with("res://"):
+		dest = Credentials.png_path(id)
+	var download: Dictionary = await _api.download(url)
+	if not download.ok:
+		_log_line("pull failed %s: %s" % [id, download.error])
+		return {}
+	var bytes: PackedByteArray = download.bytes
+	if not remote_hash.is_empty() and Hasher.bytes_sha256(bytes) != remote_hash:
+		_log_line("hash mismatch %s" % id)
+		return {}
+	if _write_png(dest, bytes) != OK:
+		_log_line("could not write %s" % dest)
+		return {}
+	return {
+		"kind": "texture",
+		"local": local,
+		"dest": dest,
+		"bytes": bytes,
+		"paths": PackedStringArray([dest]),
+	}
+
+
+func _stage_bundle(item: Dictionary, local: Dictionary, bundle: Dictionary) -> Dictionary:
+	var id := str(item.get("id", ""))
+	var remote_hash := str(item.get("remoteHash", ""))
+	var dest := str(item.get("godotPath", ""))
+	if dest.is_empty() or not dest.begins_with("res://") or dest.ends_with(".png"):
+		dest = Credentials.slot_dir(id)
+	dest = dest.rstrip("/")
+
+	var format := str(bundle.get("format", ""))
+	var keep := {}
+	var hashed_clips: Array = []
+	var hashed_bag := PackedStringArray()
+	var paths := PackedStringArray()
+
+	if format == "spritebench.clips/1":
+		for clip in bundle.get("clips", []):
+			var frames: Array = []
+			for frame in clip.get("frames", []):
+				var written := await _download_frame(dest, frame)
+				if written.is_empty():
+					return {}
+				keep[written.file] = true
+				paths.append(dest.path_join(str(written.file)))
+				frames.append(written)
+			hashed_clips.append({
+				"name": str(clip.get("name", "")),
+				"fps": int(clip.get("fps", 6)),
+				"loop": bool(clip.get("loop", true)),
+				"frames": frames,
+			})
+		if not remote_hash.is_empty() and Hasher.sprite_frames_bundle_hash(hashed_clips) != remote_hash:
+			_log_line("hash mismatch %s" % id)
+			return {}
+		_write_manifest(dest, _clips_manifest(hashed_clips))
+		_prune_slot_dir(dest, keep)
+		return {
+			"kind": "clips",
+			"local": local,
+			"dest": dest,
+			"clips": hashed_clips,
+			"paths": paths,
+		}
+
+	if format == "spritebench.bag/1":
+		var files: Array = []
+		for frame in bundle.get("frames", []):
+			var written := await _download_frame(dest, frame)
+			if written.is_empty():
+				return {}
+			keep[written.file] = true
+			hashed_bag.append(str(written.sha256))
+			files.append(written.file)
+			paths.append(dest.path_join(str(written.file)))
+		if not remote_hash.is_empty() and Hasher.textures_bundle_hash(hashed_bag) != remote_hash:
+			_log_line("hash mismatch %s" % id)
+			return {}
+		var bag_rows: Array = []
+		for file in files:
+			bag_rows.append({ "file": file })
+		_write_manifest(dest, { "format": "spritebench.bag/1", "frames": bag_rows })
+		_prune_slot_dir(dest, keep)
+		return {
+			"kind": "bag",
+			"local": local,
+			"dest": dest,
+			"files": files,
+			"paths": paths,
+		}
+
+	_log_line("unknown bundle %s" % id)
+	return {}
+
+
+func _download_frame(dest: String, frame: Dictionary) -> Dictionary:
+	var file := str(frame.get("file", ""))
+	var url := str(frame.get("url", ""))
+	if file.is_empty() or url.is_empty():
+		return {}
+	var download: Dictionary = await _api.download(url)
+	if not download.ok:
+		_log_line("pull failed %s: %s" % [file, download.error])
+		return {}
+	var path := dest.path_join(file)
+	if _write_png(path, download.bytes) != OK:
+		_log_line("could not write %s" % path)
+		return {}
+	return {
+		"file": file,
+		"hold": int(frame.get("hold", 1)),
+		"sha256": Hasher.bytes_sha256(download.bytes),
+	}
+
+
+func _commit_slot(row: Dictionary) -> bool:
+	var kind := str(row.get("kind", ""))
+	if kind == "texture":
+		var dest := str(row.dest)
+		var texture := _load_texture(dest, row.bytes)
+		if texture == null:
+			_log_line("could not load %s" % dest)
+			return false
+		_assign_texture(row.local, texture)
+		_log_line("pulled %s" % dest)
+		return true
+	if kind == "clips":
+		_assign_sprite_frames(row.local, row.dest, row.clips)
+		_log_line("pulled %s" % row.dest)
+		return true
+	if kind == "bag":
+		_assign_bag(row.local, row.dest, row.files)
+		_log_line("pulled %s" % row.dest)
+		return true
+	return false
+
+
+func _clips_manifest(clips: Array) -> Dictionary:
+	var rows: Array = []
+	for clip in clips:
+		var frames: Array = []
+		for frame in clip.get("frames", []):
+			frames.append({ "file": frame.file, "hold": int(frame.get("hold", 1)) })
+		rows.append({
+			"name": str(clip.get("name", "")),
+			"fps": int(clip.get("fps", 6)),
+			"loop": bool(clip.get("loop", true)),
+			"frames": frames,
+		})
+	return { "format": "spritebench.clips/1", "clips": rows }
+
+
+func _write_manifest(dir: String, data: Dictionary) -> void:
+	var path := dir.path_join("manifest.json")
+	var err := DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dir))
+	if err != OK and err != ERR_ALREADY_EXISTS:
+		return
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return
+	file.store_string(JSON.stringify(data, "\t"))
+
+
+func _prune_slot_dir(dir: String, keep: Dictionary) -> void:
+	var access := DirAccess.open(dir)
+	if access == null:
+		return
+	for name in access.get_files():
+		if name.ends_with(".png") and not keep.has(name):
+			access.remove(name)
+
+
+func _write_png(path: String, bytes: PackedByteArray) -> Error:
+	var dir := path.get_base_dir()
+	var err := DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dir))
+	if err != OK and err != ERR_ALREADY_EXISTS:
+		return err
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return FileAccess.get_open_error()
+	file.store_buffer(bytes)
+	_ensure_pinned_import(path)
+	return OK
+
+
+func _import_paths(paths: PackedStringArray) -> void:
+	if paths.is_empty():
+		return
+	var fs := EditorInterface.get_resource_filesystem()
+	for path in paths:
+		_ensure_pinned_import(path)
+	await _wait_fs_idle(fs)
+	var needs_scan := false
+	for path in paths:
+		if fs.get_filesystem_path(path.get_base_dir()) == null:
+			needs_scan = true
+		fs.update_file(path)
+	if needs_scan:
+		fs.scan()
+	await _wait_paths_imported(fs, paths)
+	if _fs_busy(fs):
+		return
+	var missing := PackedStringArray()
+	for path in paths:
+		if not _import_has_remap_path(path + ".import"):
+			missing.append(path)
+	if missing.is_empty():
+		return
+	fs.reimport_files(missing)
+	await _wait_paths_imported(fs, missing)
+
+
+func _hook_filesystem() -> void:
+	var fs := EditorInterface.get_resource_filesystem()
+	if not fs.resources_reimporting.is_connected(_on_resources_reimporting):
+		fs.resources_reimporting.connect(_on_resources_reimporting)
+	if not fs.resources_reimported.is_connected(_on_resources_reimported):
+		fs.resources_reimported.connect(_on_resources_reimported)
+
+
+func _unhook_filesystem() -> void:
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs.resources_reimporting.is_connected(_on_resources_reimporting):
+		fs.resources_reimporting.disconnect(_on_resources_reimporting)
+	if fs.resources_reimported.is_connected(_on_resources_reimported):
+		fs.resources_reimported.disconnect(_on_resources_reimported)
+	_reimport_pending = 0
+
+
+func _on_resources_reimporting(_files: PackedStringArray) -> void:
+	_reimport_pending += 1
+
+
+func _on_resources_reimported(_files: PackedStringArray) -> void:
+	_reimport_pending = maxi(0, _reimport_pending - 1)
+
+
+func _fs_busy(fs: EditorFileSystem) -> bool:
+	if fs.is_scanning() or _reimport_pending > 0:
+		return true
+	return fs.has_method("is_importing") and fs.is_importing()
+
+
+func _wait_fs_idle(fs: EditorFileSystem) -> void:
+	await get_tree().process_frame
+	var deadline := Time.get_ticks_msec() + 20000
+	while _fs_busy(fs) and Time.get_ticks_msec() < deadline:
+		await get_tree().process_frame
+
+
+func _wait_paths_imported(fs: EditorFileSystem, paths: PackedStringArray) -> void:
+	await get_tree().process_frame
+	var deadline := Time.get_ticks_msec() + 20000
+	while Time.get_ticks_msec() < deadline:
+		var pending := false
+		for path in paths:
+			if not _import_has_remap_path(path + ".import"):
+				pending = true
+				break
+		if not pending and not _fs_busy(fs):
+			await get_tree().process_frame
+			if not _fs_busy(fs):
+				return
+		await get_tree().process_frame
+
+
+func _ensure_pinned_import(png_path: String) -> void:
+	var import_path := png_path + ".import"
+	var cfg := ConfigFile.new()
+	if FileAccess.file_exists(import_path):
+		cfg.load(import_path)
+	if str(cfg.get_value("remap", "importer", "")).is_empty():
+		cfg.set_value("remap", "importer", "texture")
+		cfg.set_value("remap", "type", "CompressedTexture2D")
+	cfg.set_value("params", "compress/mode", 0)
+	cfg.set_value("params", "mipmaps/generate", false)
+	cfg.set_value("params", "detect_3d/compress_to", 0)
+	cfg.save(import_path)
+
+
+func _import_has_remap_path(import_path: String) -> bool:
+	if not FileAccess.file_exists(import_path):
+		return false
+	var cfg := ConfigFile.new()
+	if cfg.load(import_path) != OK or not cfg.has_section("remap"):
+		return false
+	if not str(cfg.get_value("remap", "path", "")).is_empty():
+		return true
+	for key in cfg.get_section_keys("remap"):
+		if str(key).begins_with("path.") and not str(cfg.get_value("remap", key, "")).is_empty():
+			return true
+	return false
+
+
+func _load_texture(path: String, bytes: PackedByteArray) -> Texture2D:
+	if ResourceLoader.exists(path):
+		var loaded := ResourceLoader.load(path)
+		if loaded is Texture2D:
+			return loaded
+	var img := Image.new()
+	if bytes.is_empty():
+		if img.load(path) != OK:
+			return null
+	elif img.load_png_from_buffer(bytes) != OK and img.load(path) != OK:
+		return null
+	return ImageTexture.create_from_image(img)
+
+
+func _fill_missing_textures(slots: Array[Dictionary]) -> int:
+	var filled := 0
+	for slot in slots:
+		var dest := str(slot.get("path", ""))
+		if dest.is_empty():
+			continue
+		if slot.kind == "set_bag":
+			if not FileAccess.file_exists(dest.path_join("manifest.json")):
+				continue
+			var res := ResourceLoader.load(slot.set_path)
+			if res is SpriteBenchSet:
+				var item := (res as SpriteBenchSet).item_for_key(StringName(slot.item_key))
+				if item and item.textures.is_empty():
+					_assign_bag(slot, dest, _bag_files(dest))
+					filled += 1
+			continue
+		if str(slot.get("intent", "")) == "sprite_frames":
+			var tres := dest.path_join("frames.tres")
+			if FileAccess.file_exists(tres) and _node_frames_empty(slot):
+				var frames := ResourceLoader.load(tres)
+				if frames is SpriteFrames:
+					_apply_frames_to_slot(slot, frames as SpriteFrames)
+					filled += 1
+			continue
+		if not FileAccess.file_exists(dest):
+			continue
+		if slot.kind == "set_item":
+			var res := ResourceLoader.load(slot.set_path)
+			if res is SpriteBenchSet:
+				var item := (res as SpriteBenchSet).item_for_key(StringName(slot.item_key))
+				if item and item.texture == null:
+					var tex := _load_texture(dest, PackedByteArray())
+					if tex:
+						_assign_texture(slot, tex)
+						filled += 1
+		elif _node_texture_empty(slot):
+			var tex := _load_texture(dest, PackedByteArray())
+			if tex:
+				_assign_texture(slot, tex)
+				filled += 1
+	return filled
+
+
+func _bag_files(dir: String) -> Array:
+	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(dir.path_join("manifest.json")))
+	var files: Array = []
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return files
+	for frame in parsed.get("frames", []):
+		files.append(str(frame.get("file", "")) if typeof(frame) == TYPE_DICTIONARY else str(frame))
+	return files
+
+
+func _node_texture_empty(slot: Dictionary) -> bool:
+	var node := _edited_node(slot)
+	return node is Sprite2D and (node as Sprite2D).texture == null
+
+
+func _node_frames_empty(slot: Dictionary) -> bool:
+	var node := _edited_node(slot)
+	if not node is AnimatedSprite2D:
+		return false
+	var frames := (node as AnimatedSprite2D).sprite_frames
+	return frames == null or frames.get_animation_names().is_empty()
+
+
+func _edited_node(slot: Dictionary) -> Node:
+	var scene_path := str(slot.get("scene_path", ""))
+	var node_path := str(slot.get("node_path", "."))
+	var edited := EditorInterface.get_edited_scene_root()
+	if edited and edited.scene_file_path == scene_path:
+		return edited if node_path == "." else edited.get_node_or_null(NodePath(node_path))
+	return null
+
+
+func _assign_texture(slot: Dictionary, texture: Texture2D) -> void:
+	if slot.is_empty():
+		_log_line("wrote PNG but no local slot to assign")
+		return
+	if slot.kind == "set_item":
+		var res := ResourceLoader.load(slot.set_path)
+		if res is SpriteBenchSet:
+			var item := (res as SpriteBenchSet).item_for_key(StringName(slot.item_key))
+			if item:
+				item.texture = texture
+				item.emit_changed()
+				res.emit_changed()
+				ResourceSaver.save(res, slot.set_path)
+		return
+	_mutate_node(slot, func(node: Node) -> void:
+		_apply_to_node(node, texture)
+	)
+
+
+func _assign_bag(slot: Dictionary, dest: String, files: Array) -> void:
+	if slot.is_empty() or slot.kind != "set_bag":
+		return
+	var textures: Array[Texture2D] = []
+	for file in files:
+		var tex := _load_texture(dest.path_join(str(file)), PackedByteArray())
+		if tex:
+			textures.append(tex)
+	var res := ResourceLoader.load(slot.set_path)
+	if res is SpriteBenchSet:
+		var item := (res as SpriteBenchSet).item_for_key(StringName(slot.item_key))
+		if item:
+			item.as_array = true
+			item.textures = textures
+			item.emit_changed()
+			res.emit_changed()
+			ResourceSaver.save(res, slot.set_path)
+
+
+func _assign_sprite_frames(slot: Dictionary, dest: String, clips: Array) -> void:
+	var tres := dest.path_join("frames.tres")
+	var frames := _sprite_frames_resource(slot, tres)
+	for clip in clips:
+		var row: Dictionary = clip
+		var name := StringName(str(row.get("name", "default")))
+		if not frames.has_animation(name):
+			frames.add_animation(name)
+		frames.clear(name)
+		frames.set_animation_speed(name, float(row.get("fps", 6)))
+		frames.set_animation_loop(name, bool(row.get("loop", true)))
+		for frame in row.get("frames", []):
+			var entry: Dictionary = frame
+			var tex := _load_texture(dest.path_join(str(entry.get("file", ""))), PackedByteArray())
+			if tex:
+				frames.add_frame(name, tex, float(entry.get("hold", 1)))
+	frames.take_over_path(tres)
+	ResourceSaver.save(frames, tres)
+	_apply_frames_to_slot(slot, frames)
+
+
+func _sprite_frames_resource(slot: Dictionary, tres: String) -> SpriteFrames:
+	if ResourceLoader.exists(tres):
+		var loaded := ResourceLoader.load(tres)
+		if loaded is SpriteFrames:
+			return loaded as SpriteFrames
+	var node := _edited_node(slot)
+	if node is AnimatedSprite2D:
+		var existing := (node as AnimatedSprite2D).sprite_frames
+		if existing:
+			return existing.duplicate(true) as SpriteFrames
+	var scene_path := str(slot.get("scene_path", ""))
+	if scene_path.is_empty() or not FileAccess.file_exists(scene_path):
+		return SpriteFrames.new()
+	var packed := load(scene_path) as PackedScene
+	if packed == null:
+		return SpriteFrames.new()
+	var root := packed.instantiate()
+	var node_path := str(slot.get("node_path", "."))
+	var target := root if node_path == "." else root.get_node_or_null(NodePath(node_path))
+	var copy: SpriteFrames = null
+	if target is AnimatedSprite2D:
+		var existing := (target as AnimatedSprite2D).sprite_frames
+		if existing:
+			copy = existing.duplicate(true) as SpriteFrames
+	root.free()
+	return copy if copy else SpriteFrames.new()
+
+
+func _apply_frames_to_slot(slot: Dictionary, frames: SpriteFrames) -> void:
+	_mutate_node(slot, func(node: Node) -> void:
+		if node is CanvasItem:
+			(node as CanvasItem).texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		if node is AnimatedSprite2D:
+			var sprite := node as AnimatedSprite2D
+			sprite.sprite_frames = frames
+			if sprite.animation == &"" and frames.get_animation_names().size() > 0:
+				sprite.animation = StringName(frames.get_animation_names()[0])
+	)
+
+
+func _mutate_node(slot: Dictionary, apply: Callable) -> void:
+	var scene_path := str(slot.get("scene_path", ""))
+	var node_path := str(slot.get("node_path", "."))
+	var edited := EditorInterface.get_edited_scene_root()
+	if edited and edited.scene_file_path == scene_path:
+		var node := edited if node_path == "." else edited.get_node_or_null(NodePath(node_path))
+		if node:
+			apply.call(node)
+			EditorInterface.mark_scene_as_unsaved()
+		return
+	if scene_path.is_empty() or not FileAccess.file_exists(scene_path):
+		return
+	var packed := load(scene_path) as PackedScene
+	if packed == null:
+		return
+	var root := packed.instantiate()
+	var target := root if node_path == "." else root.get_node_or_null(NodePath(node_path))
+	if target:
+		apply.call(target)
+		var next := PackedScene.new()
+		if next.pack(root) == OK:
+			ResourceSaver.save(next, scene_path)
+	root.free()
+
+
+func _apply_to_node(node: Node, texture: Texture2D) -> void:
+	if node is CanvasItem:
+		(node as CanvasItem).texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	if node is Sprite2D:
+		(node as Sprite2D).texture = texture
+
+
+func _collect_slots() -> Array[Dictionary]:
+	var slots: Array[Dictionary] = []
+	var seen := {}
+	var edited := EditorInterface.get_edited_scene_root()
+	var edited_path := edited.scene_file_path if edited else ""
+	if edited:
+		_collect_tree(edited, edited_path, slots, seen)
+	for path in _walk("res://", [".tscn"]):
+		if path == edited_path:
+			continue
+		_collect_tscn(path, slots, seen)
+	for path in _walk("res://", [".tres", ".res"]):
+		if not _looks_like_set(path):
+			continue
+		var res := ResourceLoader.load(path)
+		if res is SpriteBenchSet:
+			_collect_set(res as SpriteBenchSet, path, slots, seen)
+	return slots
+
+
+func _collect_tree(root: Node, scene_path: String, slots: Array[Dictionary], seen: Dictionary) -> void:
+	_walk_node(root, root, scene_path, slots, seen)
+
+
+func _walk_node(root: Node, node: Node, scene_path: String, slots: Array[Dictionary], seen: Dictionary) -> void:
+	if (node is Sprite2D or node is AnimatedSprite2D) and node.has_meta(Credentials.SLOT_META):
+		var id := str(node.get_meta(Credentials.SLOT_META))
+		if _is_uuid(id) and not seen.has(id):
+			var node_path := str(root.get_path_to(node))
+			slots.append(_node_slot(id, scene_path, node_path, node.name, node is AnimatedSprite2D))
+			seen[id] = true
+	for child in node.get_children():
+		if child.scene_file_path != "" and child != root:
+			continue
+		_walk_node(root, child, scene_path, slots, seen)
+
+
+func _collect_tscn(path: String, slots: Array[Dictionary], seen: Dictionary) -> void:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		return
+	var name := ""
+	var type := ""
+	var parent := ""
+	var node_path := ""
+	var slot_id := ""
+	for line in file.get_as_text().split("\n"):
+		if line.begins_with("[node "):
+			_flush_tscn_node(path, name, type, node_path, slot_id, slots, seen)
+			name = _attr(line, "name")
+			type = _attr(line, "type")
+			parent = _attr(line, "parent")
+			slot_id = ""
+			if parent.is_empty():
+				node_path = "."
+			elif parent == ".":
+				node_path = name
+			else:
+				node_path = parent.path_join(name)
+		elif line.begins_with("metadata/%s" % Credentials.SLOT_META):
+			slot_id = _quoted(line)
+	_flush_tscn_node(path, name, type, node_path, slot_id, slots, seen)
+
+
+func _flush_tscn_node(
+	scene_path: String,
+	name: String,
+	type: String,
+	node_path: String,
+	slot_id: String,
+	slots: Array[Dictionary],
+	seen: Dictionary
+) -> void:
+	if slot_id.is_empty() or seen.has(slot_id):
+		return
+	if type != "Sprite2D" and type != "AnimatedSprite2D":
+		return
+	if not _is_uuid(slot_id):
+		return
+	slots.append(_node_slot(slot_id, scene_path, node_path, name, type == "AnimatedSprite2D"))
+	seen[slot_id] = true
+
+
+func _collect_set(res: SpriteBenchSet, path: String, slots: Array[Dictionary], seen: Dictionary) -> void:
+	var dirty := false
+	for item in res.items:
+		if item == null:
+			continue
+		var before := item.slot_id
+		var id := item.ensure_slot_id()
+		if before != id:
+			dirty = true
+		if not _is_uuid(id) or seen.has(id):
+			continue
+		var key := String(item.key)
+		if key.is_empty():
+			key = id.substr(0, 8)
+		var as_array := bool(item.as_array)
+		var dest := Credentials.slot_dir(id) if as_array else Credentials.png_path(id)
+		if not as_array and item.texture and item.texture.resource_path.begins_with("res://"):
+			dest = item.texture.resource_path
+		slots.append({
+			"id": id,
+			"kind": "set_bag" if as_array else "set_item",
+			"intent": "textures" if as_array else "texture",
+			"label": _clip(key, 255),
+			"path": dest,
+			"localHash": _bundle_hash(dest) if as_array else _local_hash(dest),
+			"set_path": path,
+			"item_key": key,
+		})
+		seen[id] = true
+	if dirty:
+		ResourceSaver.save(res, path)
+
+
+func _node_slot(
+	id: String,
+	scene_path: String,
+	node_path: String,
+	node_name: String,
+	animated: bool
+) -> Dictionary:
+	var dest := Credentials.slot_dir(id) if animated else Credentials.png_path(id)
+	var label := node_name
+	if not scene_path.is_empty():
+		label = "%s:%s" % [scene_path.get_file(), node_path]
+	return {
+		"id": id,
+		"kind": "node",
+		"intent": "sprite_frames" if animated else "texture",
+		"label": _clip(label, 255),
+		"path": dest,
+		"localHash": _bundle_hash(dest) if animated else _local_hash(dest),
+		"scene_path": scene_path,
+		"node_path": node_path,
+	}
+
+
+func _local_hash(path: String) -> Variant:
+	var digest := Hasher.file_sha256(path)
+	if digest.length() != 64:
+		return null
+	return digest
+
+
+func _bundle_hash(path: String) -> Variant:
+	var digest := Hasher.hash_from_dir(path)
+	if digest.length() != 64:
+		return null
+	return digest
+
+
+func _looks_like_set(path: String) -> bool:
+	if path.ends_with(".res"):
+		return true
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		return false
+	var head := file.get_buffer(mini(file.get_length(), 2048)).get_string_from_utf8()
+	return "SpriteBenchSet" in head
+
+
+func _walk(path: String, suffixes: Array[String]) -> PackedStringArray:
+	var out := PackedStringArray()
+	var dir := DirAccess.open(path)
+	if dir == null:
+		return out
+	for name in dir.get_directories():
+		if name.begins_with("."):
+			continue
+		if path == "res://" and name == "addons":
+			continue
+		out.append_array(_walk(path.path_join(name), suffixes))
+	for name in dir.get_files():
+		for suffix in suffixes:
+			if name.ends_with(suffix):
+				out.append(path.path_join(name))
+				break
+	return out
+
+
+func _attr(header: String, key: String) -> String:
+	var needle := '%s="' % key
+	var start := header.find(needle)
+	if start < 0:
+		return ""
+	start += needle.length()
+	var end := header.find('"', start)
+	if end < 0:
+		return ""
+	return header.substr(start, end - start)
+
+
+func _quoted(line: String) -> String:
+	var start := line.find('"')
+	if start < 0:
+		return ""
+	var end := line.find('"', start + 1)
+	if end < 0:
+		return ""
+	return line.substr(start + 1, end - start - 1)
+
+
+func _clip(text: String, limit: int) -> String:
+	if text.length() <= limit:
+		return text
+	return text.substr(0, limit)
+
+
+func _is_uuid(value: String) -> bool:
+	var re := RegEx.new()
+	re.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+	return re.search(value) != null
