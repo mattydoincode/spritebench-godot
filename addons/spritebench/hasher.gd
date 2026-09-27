@@ -102,3 +102,32 @@ static func uuid_v4() -> String:
 		bytes.slice(8, 10).hex_encode(),
 		bytes.slice(10, 16).hex_encode(),
 	]
+
+
+## Fixed namespace shared with SpriteBench `src/server/fieldSlotId.ts`.
+const FIELD_SLOT_NAMESPACE := "a3f1c9e2-5b7d-4e8a-9c0f-1d2e3f4a5b6c"
+
+
+static func uuid_v5(name: String, ns: String) -> String:
+	var ctx := HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA1)
+	ctx.update(ns.replace("-", "").hex_decode())
+	ctx.update(name.to_utf8_buffer())
+	var bytes := ctx.finish().slice(0, 16)
+	bytes[6] = (bytes[6] & 0x0f) | 0x50
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	return "%s-%s-%s-%s-%s" % [
+		bytes.slice(0, 4).hex_encode(),
+		bytes.slice(4, 6).hex_encode(),
+		bytes.slice(6, 8).hex_encode(),
+		bytes.slice(8, 10).hex_encode(),
+		bytes.slice(10, 16).hex_encode(),
+	]
+
+
+## Both sides derive a record field's slot id, so a record created in
+## SpriteBench can take art before Godot has seen it.
+## "11111111-2222-4333-8444-555555555555" + "front" is
+## "29917306-d641-5d37-bba3-d60a30539cdc" (checked in SpriteBench tests).
+static func field_slot_id(record_id: String, field_key: String) -> String:
+	return uuid_v5("%s:%s" % [record_id.to_lower(), field_key], FIELD_SLOT_NAMESPACE)

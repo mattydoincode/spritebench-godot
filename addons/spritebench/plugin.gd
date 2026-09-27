@@ -21,6 +21,9 @@ var _syncing := false
 var _sync_queued := false
 var _draining := false
 var _reimport_pending := 0
+## Slot path (a PNG, or a bag directory) → import profile, from the last
+## collect. Paths not listed get the pixel-art defaults.
+var _import_profiles := {}
 
 
 func _enter_tree() -> void:
@@ -32,6 +35,9 @@ func _enter_tree() -> void:
 	add_inspector_plugin(_inspector)
 	add_custom_type("SpriteBenchItem", "Resource", preload("spritebench_item.gd"), null)
 	add_custom_type("SpriteBenchSet", "Resource", preload("spritebench_set.gd"), null)
+	add_custom_type("SpriteBenchField", "Resource", preload("spritebench_field.gd"), null)
+	add_custom_type("SpriteBenchRecord", "Resource", preload("spritebench_record.gd"), null)
+	add_custom_type("SpriteBenchCollection", "Resource", preload("spritebench_collection.gd"), null)
 	_dock = _build_dock()
 	add_control_to_dock(DOCK_SLOT_LEFT_UR, _dock)
 	_hook_filesystem()
@@ -44,6 +50,9 @@ func _exit_tree() -> void:
 	if _inspector.slot_changed.is_connected(_request_sync):
 		_inspector.slot_changed.disconnect(_request_sync)
 	remove_inspector_plugin(_inspector)
+	remove_custom_type("SpriteBenchCollection")
+	remove_custom_type("SpriteBenchRecord")
+	remove_custom_type("SpriteBenchField")
 	remove_custom_type("SpriteBenchSet")
 	remove_custom_type("SpriteBenchItem")
 	remove_control_from_docks(_dock)
@@ -224,12 +233,24 @@ func _sync() -> void:
 	_set_status("Syncing…")
 
 	var slots := _collect_slots()
+	await _apply_import_profiles()
 	var catalog := await _push_catalog(slots)
 	if catalog.is_empty():
 		_set_busy(false)
 		return
 
-	_report_catalog(catalog)
+	# Records added, renamed or deleted in SpriteBench land in the resources
+	# first, so the pull below has a local slot to assign each field into.
+	var changed := _apply_collections(catalog.get("collections", []))
+	if changed > 0:
+		_log_line("updated %s records from SpriteBench" % changed)
+		slots = _collect_slots()
+		catalog = await _push_catalog(slots)
+		if catalog.is_empty():
+			_set_busy(false)
+			return
+
+	_report_catalog(catalog.get("slots", []))
 	var pulled := await _pull_and_write(slots)
 	if pulled < 0:
 		_set_busy(false)
@@ -243,15 +264,23 @@ func _sync() -> void:
 			return
 
 	var filled := _fill_missing_textures(_collect_slots())
-	_set_status("Synced %s slots, pulled %s." % [slots.size(), pulled])
+	var fs := EditorInterface.get_resource_filesystem()
+	if _fs_busy(fs):
+		await _wait_fs_idle(fs)
+		filled += _fill_missing_textures(_collect_slots())
+	var slot_count := slots.filter(func(slot: Dictionary) -> bool: return not slot.has("collection")).size()
+	_set_status("Synced %s slots, pulled %s." % [slot_count, pulled])
 	if filled > 0:
 		_log_line("assigned %s on-disk textures" % filled)
 	_set_busy(false)
 
 
-func _push_catalog(slots: Array[Dictionary]) -> Array:
+## Returns the response body (`slots`, `collections`), or {} on failure.
+func _push_catalog(slots: Array[Dictionary]) -> Dictionary:
 	var payload: Array = []
 	for slot in slots:
+		if slot.has("collection"):
+			continue
 		payload.append({
 			"id": slot.id,
 			"kind": slot.kind,
@@ -260,16 +289,78 @@ func _push_catalog(slots: Array[Dictionary]) -> Array:
 			"path": slot.path,
 			"localHash": slot.localHash,
 		})
+	var collections: Array = []
+	for slot in slots:
+		if slot.has("collection"):
+			collections.append(slot.collection)
 	var response: Dictionary = await _api.post_json(
 		"/api/v1/projects/%s/slots" % Credentials.project_id(),
-		{"slots": payload}
+		{"slots": payload, "collections": collections}
 	)
 	if not response.ok:
 		_set_status(response.error)
 		_log_line(response.error)
-		return []
-	var rows: Array = response.data.get("slots", [])
-	return rows
+		return {}
+	var data: Dictionary = response.data if typeof(response.data) == TYPE_DICTIONARY else {}
+	if not data.has("slots"):
+		data["slots"] = []
+	return data
+
+
+## Makes each local collection match SpriteBench: adds records created there,
+## takes keys renamed there, and drops records deleted there. Returns how
+## many records changed.
+func _apply_collections(rows: Array) -> int:
+	var changed := 0
+	var paths := _collection_paths()
+	for row in rows:
+		if typeof(row) != TYPE_DICTIONARY:
+			continue
+		var path := str(paths.get(str(row.get("id", "")), ""))
+		if path.is_empty():
+			continue
+		var res := ResourceLoader.load(path)
+		if not res is SpriteBenchCollection:
+			continue
+		var collection := res as SpriteBenchCollection
+		var dirty := 0
+		for removed in row.get("removedRecordIds", []):
+			var gone := collection.record_by_id(str(removed))
+			if gone:
+				collection.records.erase(gone)
+				_log_line("removed %s from %s" % [gone.key, path.get_file()])
+				dirty += 1
+		for entry in row.get("records", []):
+			var record_id := str(entry.get("id", ""))
+			var key := StringName(str(entry.get("key", "")))
+			var local := collection.record_by_id(record_id)
+			if local == null:
+				local = SpriteBenchRecord.new()
+				local.id = record_id
+				local.key = key
+				collection.records.append(local)
+				_log_line("added %s to %s" % [key, path.get_file()])
+				dirty += 1
+			elif bool(entry.get("pending", false)) and local.key != key:
+				_log_line("renamed %s to %s" % [local.key, key])
+				local.key = key
+				dirty += 1
+		if dirty > 0:
+			collection.emit_changed()
+			_save(collection, path)
+			changed += dirty
+	return changed
+
+
+func _collection_paths() -> Dictionary:
+	var out := {}
+	for path in _walk("res://", [".tres", ".res"]):
+		if not _looks_like(path, "SpriteBenchCollection"):
+			continue
+		var res := ResourceLoader.load(path)
+		if res is SpriteBenchCollection:
+			out[(res as SpriteBenchCollection).id] = path
+	return out
 
 
 func _report_catalog(rows: Array) -> void:
@@ -445,9 +536,9 @@ func _commit_slot(row: Dictionary) -> bool:
 	var kind := str(row.get("kind", ""))
 	if kind == "texture":
 		var dest := str(row.dest)
-		var texture := _load_texture(dest, row.bytes)
+		var texture := _imported_texture(dest)
 		if texture == null:
-			_log_line("could not load %s" % dest)
+			_log_line("waiting for import: %s" % dest)
 			return false
 		_assign_texture(row.local, texture)
 		_log_line("pulled %s" % dest)
@@ -525,17 +616,20 @@ func _import_paths(paths: PackedStringArray) -> void:
 		fs.update_file(path)
 	if needs_scan:
 		fs.scan()
-	await _wait_paths_imported(fs, paths)
-	if _fs_busy(fs):
-		return
-	var missing := PackedStringArray()
+	# A pull that overwrites a file keeps its old import on record, and
+	# `update_file` alone does not replace it; without this the old art stays
+	# in the cache and gets assigned as if it were the new one.
+	await _wait_fs_idle(fs)
+	var stale := PackedStringArray()
 	for path in paths:
-		if not _import_has_remap_path(path + ".import"):
-			missing.append(path)
-	if missing.is_empty():
-		return
-	fs.reimport_files(missing)
-	await _wait_paths_imported(fs, missing)
+		if not _import_current(path):
+			stale.append(path)
+	if not stale.is_empty():
+		fs.reimport_files(stale)
+	await _wait_paths_imported(fs, paths)
+	for path in paths:
+		if ResourceLoader.has_cached(path):
+			ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE)
 
 
 func _hook_filesystem() -> void:
@@ -576,23 +670,49 @@ func _wait_fs_idle(fs: EditorFileSystem) -> void:
 		await get_tree().process_frame
 
 
+## Waits while imports keep landing. Gives up after 30 s with no progress or
+## 10 min in all, so a big batch of large images is not cut off mid-import.
 func _wait_paths_imported(fs: EditorFileSystem, paths: PackedStringArray) -> void:
 	await get_tree().process_frame
-	var deadline := Time.get_ticks_msec() + 20000
-	while Time.get_ticks_msec() < deadline:
-		var pending := false
+	var started := Time.get_ticks_msec()
+	var last_progress := started
+	var done := -1
+	while Time.get_ticks_msec() - last_progress < 30000 and Time.get_ticks_msec() - started < 600000:
+		var imported := 0
 		for path in paths:
-			if not _import_has_remap_path(path + ".import"):
-				pending = true
-				break
-		if not pending and not _fs_busy(fs):
+			if _import_current(path):
+				imported += 1
+		if imported != done:
+			done = imported
+			last_progress = Time.get_ticks_msec()
+			if paths.size() > 4:
+				_set_status("Importing %s/%s…" % [imported, paths.size()])
+		if imported == paths.size() and not _fs_busy(fs):
 			await get_tree().process_frame
 			if not _fs_busy(fs):
 				return
 		await get_tree().process_frame
 
 
-func _ensure_pinned_import(png_path: String) -> void:
+func _import_profile(png_path: String) -> Dictionary:
+	if _import_profiles.has(png_path):
+		return _import_profiles[png_path]
+	return _import_profiles.get(png_path.get_base_dir(), {})
+
+
+## Pixel art: lossless, no mipmaps. 3D art: VRAM-compressed with mipmaps.
+func _import_params(profile: Dictionary) -> Dictionary:
+	var for_3d := bool(profile.get("for_3d", false))
+	return {
+		"compress/mode": 2 if for_3d else 0,
+		"mipmaps/generate": for_3d,
+		"detect_3d/compress_to": 0,
+		"process/size_limit": int(profile.get("max_size", 0)),
+	}
+
+
+## Returns true when the settings changed, meaning a reimport is due.
+func _ensure_pinned_import(png_path: String) -> bool:
 	var import_path := png_path + ".import"
 	var cfg := ConfigFile.new()
 	if FileAccess.file_exists(import_path):
@@ -600,45 +720,148 @@ func _ensure_pinned_import(png_path: String) -> void:
 	if str(cfg.get_value("remap", "importer", "")).is_empty():
 		cfg.set_value("remap", "importer", "texture")
 		cfg.set_value("remap", "type", "CompressedTexture2D")
-	cfg.set_value("params", "compress/mode", 0)
-	cfg.set_value("params", "mipmaps/generate", false)
-	cfg.set_value("params", "detect_3d/compress_to", 0)
-	cfg.save(import_path)
+	var changed := false
+	var params := _import_params(_import_profile(png_path))
+	for key in params:
+		if cfg.get_value("params", key, null) != params[key]:
+			cfg.set_value("params", key, params[key])
+			changed = true
+	if changed or not FileAccess.file_exists(import_path):
+		cfg.save(import_path)
+	return changed
 
 
-func _import_has_remap_path(import_path: String) -> bool:
-	if not FileAccess.file_exists(import_path):
-		return false
+## Brings files already on disk in line with their slot's import profile,
+## so switching a collection to 3D reimports what was pulled before.
+func _apply_import_profiles() -> void:
+	var changed := PackedStringArray()
+	for path in _import_profiles:
+		var files := PackedStringArray()
+		if str(path).ends_with(".png"):
+			if FileAccess.file_exists(path):
+				files.append(path)
+		else:
+			for name in DirAccess.get_files_at(path):
+				if name.ends_with(".png"):
+					files.append(str(path).path_join(name))
+		for file in files:
+			if FileAccess.file_exists(file + ".import") and _ensure_pinned_import(file):
+				changed.append(file)
+	if changed.is_empty():
+		return
+	_log_line("reimporting %s images with new import settings" % changed.size())
+	var fs := EditorInterface.get_resource_filesystem()
+	await _wait_fs_idle(fs)
+	fs.reimport_files(changed)
+	await _wait_paths_imported(fs, changed)
+
+
+## True when Godot's import of `png_path` was made from the file as it is on
+## disk now, going by the source checksum Godot keeps next to the import.
+func _import_current(png_path: String) -> bool:
 	var cfg := ConfigFile.new()
-	if cfg.load(import_path) != OK or not cfg.has_section("remap"):
+	if cfg.load(png_path + ".import") != OK or not cfg.has_section("remap"):
 		return false
-	if not str(cfg.get_value("remap", "path", "")).is_empty():
-		return true
+	var dest := ""
 	for key in cfg.get_section_keys("remap"):
-		if str(key).begins_with("path.") and not str(cfg.get_value("remap", key, "")).is_empty():
-			return true
-	return false
+		if key == "path" or str(key).begins_with("path."):
+			dest = str(cfg.get_value("remap", key, ""))
+			if not dest.is_empty():
+				break
+	if dest.is_empty():
+		return false
+	var md5_path := dest.substr(0, dest.find(".", dest.rfind("-"))) + ".md5"
+	var md5 := ConfigFile.new()
+	if md5.load(md5_path) != OK:
+		return false
+	return str(md5.get_value("", "source_md5", "")) == FileAccess.get_md5(png_path)
 
 
-func _load_texture(path: String, bytes: PackedByteArray) -> Texture2D:
-	if ResourceLoader.exists(path):
-		var loaded := ResourceLoader.load(path)
-		if loaded is Texture2D:
-			return loaded
-	var img := Image.new()
-	if bytes.is_empty():
-		if img.load(path) != OK:
-			return null
-	elif img.load_png_from_buffer(bytes) != OK and img.load(path) != OK:
+func _imported_texture(path: String) -> Texture2D:
+	if not ResourceLoader.exists(path):
 		return null
-	return ImageTexture.create_from_image(img)
+	var loaded := ResourceLoader.load(path)
+	if loaded is Texture2D and _is_file_backed(loaded):
+		return loaded
+	return null
+
+
+func _is_file_backed(resource: Resource) -> bool:
+	var path := resource.resource_path
+	return path.begins_with("res://") and not "::" in path
+
+
+## Last line of defence before a save: drops any texture that would be
+## embedded. Returns how many were dropped.
+func _strip_embedded(res: Resource) -> int:
+	var dropped := 0
+	if res is SpriteBenchCollection:
+		for record in (res as SpriteBenchCollection).records:
+			if record == null:
+				continue
+			for field in record.textures.keys():
+				var tex: Texture2D = record.textures[field]
+				if tex and not _is_file_backed(tex):
+					record.textures.erase(field)
+					dropped += 1
+			for field in record.arrays.keys():
+				var kept: Array = []
+				for tex in record.arrays[field]:
+					if tex is Texture2D and _is_file_backed(tex):
+						kept.append(tex)
+					else:
+						dropped += 1
+				record.arrays[field] = kept
+	elif res is SpriteBenchSet:
+		for item in (res as SpriteBenchSet).items:
+			if item == null:
+				continue
+			if item.texture and not _is_file_backed(item.texture):
+				item.texture = null
+				dropped += 1
+			var kept: Array[Texture2D] = []
+			for tex in item.textures:
+				if tex and _is_file_backed(tex):
+					kept.append(tex)
+				else:
+					dropped += 1
+			item.textures = kept
+	elif res is SpriteFrames:
+		var frames := res as SpriteFrames
+		for anim in frames.get_animation_names():
+			for index in range(frames.get_frame_count(anim) - 1, -1, -1):
+				var tex := frames.get_frame_texture(anim, index)
+				if tex and not _is_file_backed(tex):
+					frames.remove_frame(anim, index)
+					dropped += 1
+	return dropped
+
+
+func _save(res: Resource, path: String) -> void:
+	var dropped := _strip_embedded(res)
+	if dropped > 0:
+		_log_line("skipped %s unimported textures in %s; the next sync assigns them" % [dropped, path.get_file()])
+	ResourceSaver.save(res, path)
 
 
 func _fill_missing_textures(slots: Array[Dictionary]) -> int:
 	var filled := 0
 	for slot in slots:
 		var dest := str(slot.get("path", ""))
-		if dest.is_empty():
+		if dest.is_empty() or slot.has("collection"):
+			continue
+		if slot.kind == "record_field":
+			if not _record_field_empty(slot):
+				continue
+			if slot.intent == "textures":
+				if FileAccess.file_exists(dest.path_join("manifest.json")):
+					_assign_bag(slot, dest, _bag_files(dest))
+					filled += 1
+			elif FileAccess.file_exists(dest):
+				var tex := _imported_texture(dest)
+				if tex:
+					_assign_texture(slot, tex)
+					filled += 1
 			continue
 		if slot.kind == "set_bag":
 			if not FileAccess.file_exists(dest.path_join("manifest.json")):
@@ -665,12 +888,12 @@ func _fill_missing_textures(slots: Array[Dictionary]) -> int:
 			if res is SpriteBenchSet:
 				var item := (res as SpriteBenchSet).item_for_key(StringName(slot.item_key))
 				if item and item.texture == null:
-					var tex := _load_texture(dest, PackedByteArray())
+					var tex := _imported_texture(dest)
 					if tex:
 						_assign_texture(slot, tex)
 						filled += 1
 		elif _node_texture_empty(slot):
-			var tex := _load_texture(dest, PackedByteArray())
+			var tex := _imported_texture(dest)
 			if tex:
 				_assign_texture(slot, tex)
 				filled += 1
@@ -721,7 +944,12 @@ func _assign_texture(slot: Dictionary, texture: Texture2D) -> void:
 				item.texture = texture
 				item.emit_changed()
 				res.emit_changed()
-				ResourceSaver.save(res, slot.set_path)
+				_save(res, slot.set_path)
+		return
+	if slot.kind == "record_field":
+		_mutate_record(slot, func(record: SpriteBenchRecord) -> void:
+			record.set_texture(StringName(slot.field_key), texture)
+		)
 		return
 	_mutate_node(slot, func(node: Node) -> void:
 		_apply_to_node(node, texture)
@@ -729,13 +957,20 @@ func _assign_texture(slot: Dictionary, texture: Texture2D) -> void:
 
 
 func _assign_bag(slot: Dictionary, dest: String, files: Array) -> void:
-	if slot.is_empty() or slot.kind != "set_bag":
+	if slot.is_empty() or (slot.kind != "set_bag" and slot.kind != "record_field"):
 		return
 	var textures: Array[Texture2D] = []
 	for file in files:
-		var tex := _load_texture(dest.path_join(str(file)), PackedByteArray())
-		if tex:
-			textures.append(tex)
+		var tex := _imported_texture(dest.path_join(str(file)))
+		if tex == null:
+			_log_line("waiting for import: %s" % dest.path_join(str(file)))
+			return
+		textures.append(tex)
+	if slot.kind == "record_field":
+		_mutate_record(slot, func(record: SpriteBenchRecord) -> void:
+			record.set_textures(StringName(slot.field_key), textures)
+		)
+		return
 	var res := ResourceLoader.load(slot.set_path)
 	if res is SpriteBenchSet:
 		var item := (res as SpriteBenchSet).item_for_key(StringName(slot.item_key))
@@ -744,10 +979,41 @@ func _assign_bag(slot: Dictionary, dest: String, files: Array) -> void:
 			item.textures = textures
 			item.emit_changed()
 			res.emit_changed()
-			ResourceSaver.save(res, slot.set_path)
+			_save(res, slot.set_path)
+
+
+func _mutate_record(slot: Dictionary, apply: Callable) -> void:
+	var res := ResourceLoader.load(slot.set_path)
+	if not res is SpriteBenchCollection:
+		return
+	var record := (res as SpriteBenchCollection).record_by_id(str(slot.record_id))
+	if record == null:
+		return
+	apply.call(record)
+	res.emit_changed()
+	_save(res, slot.set_path)
+
+
+func _record_field_empty(slot: Dictionary) -> bool:
+	var res := ResourceLoader.load(slot.set_path)
+	if not res is SpriteBenchCollection:
+		return false
+	var record := (res as SpriteBenchCollection).record_by_id(str(slot.record_id))
+	if record == null:
+		return false
+	var field := StringName(slot.field_key)
+	if slot.intent == "textures":
+		return (record.arrays.get(field, []) as Array).is_empty()
+	return record.get_texture(field) == null
 
 
 func _assign_sprite_frames(slot: Dictionary, dest: String, clips: Array) -> void:
+	for clip in clips:
+		for frame in (clip as Dictionary).get("frames", []):
+			var file := dest.path_join(str((frame as Dictionary).get("file", "")))
+			if _imported_texture(file) == null:
+				_log_line("waiting for import: %s" % file)
+				return
 	var tres := dest.path_join("frames.tres")
 	var frames := _sprite_frames_resource(slot, tres)
 	for clip in clips:
@@ -760,11 +1026,11 @@ func _assign_sprite_frames(slot: Dictionary, dest: String, clips: Array) -> void
 		frames.set_animation_loop(name, bool(row.get("loop", true)))
 		for frame in row.get("frames", []):
 			var entry: Dictionary = frame
-			var tex := _load_texture(dest.path_join(str(entry.get("file", ""))), PackedByteArray())
+			var tex := _imported_texture(dest.path_join(str(entry.get("file", ""))))
 			if tex:
 				frames.add_frame(name, tex, float(entry.get("hold", 1)))
 	frames.take_over_path(tres)
-	ResourceSaver.save(frames, tres)
+	_save(frames, tres)
 	_apply_frames_to_slot(slot, frames)
 
 
@@ -834,6 +1100,8 @@ func _mutate_node(slot: Dictionary, apply: Callable) -> void:
 
 
 func _apply_to_node(node: Node, texture: Texture2D) -> void:
+	if texture == null or not _is_file_backed(texture):
+		return
 	if node is CanvasItem:
 		(node as CanvasItem).texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	if node is Sprite2D:
@@ -841,6 +1109,7 @@ func _apply_to_node(node: Node, texture: Texture2D) -> void:
 
 
 func _collect_slots() -> Array[Dictionary]:
+	_import_profiles.clear()
 	var slots: Array[Dictionary] = []
 	var seen := {}
 	var edited := EditorInterface.get_edited_scene_root()
@@ -852,11 +1121,13 @@ func _collect_slots() -> Array[Dictionary]:
 			continue
 		_collect_tscn(path, slots, seen)
 	for path in _walk("res://", [".tres", ".res"]):
-		if not _looks_like_set(path):
+		if not _looks_like(path, "SpriteBenchSet") and not _looks_like(path, "SpriteBenchCollection"):
 			continue
 		var res := ResourceLoader.load(path)
 		if res is SpriteBenchSet:
 			_collect_set(res as SpriteBenchSet, path, slots, seen)
+		elif res is SpriteBenchCollection:
+			_collect_collection(res as SpriteBenchCollection, path, slots, seen)
 	return slots
 
 
@@ -953,7 +1224,74 @@ func _collect_set(res: SpriteBenchSet, path: String, slots: Array[Dictionary], s
 		})
 		seen[id] = true
 	if dirty:
-		ResourceSaver.save(res, path)
+		_save(res, path)
+
+
+## One slot per record and field, plus one entry carrying the collection
+## itself (marked by a `collection` key) for the catalog's `collections`.
+func _collect_collection(
+	res: SpriteBenchCollection,
+	path: String,
+	slots: Array[Dictionary],
+	seen: Dictionary
+) -> void:
+	if res.ensure_ids():
+		_save(res, path)
+	if seen.has(res.id):
+		return
+	seen[res.id] = true
+	var label := res.label.strip_edges()
+	if label.is_empty():
+		label = path.get_file().get_basename()
+
+	var fields: Array = []
+	var field_keys := {}
+	for field in res.fields:
+		if field == null or String(field.key).is_empty() or field_keys.has(field.key):
+			continue
+		field_keys[field.key] = true
+		fields.append({
+			"key": _clip(String(field.key), 64),
+			"intent": "textures" if field.as_array else "texture",
+		})
+
+	var profile := { "for_3d": res.for_3d, "max_size": res.max_size }
+	var records: Array = []
+	for record in res.records:
+		if record == null:
+			continue
+		var record_key := _clip(String(record.key), 120)
+		records.append({ "id": record.id, "key": record_key })
+		for field in fields:
+			var id := Hasher.field_slot_id(record.id, field.key)
+			var as_array: bool = field.intent == "textures"
+			var dest := Credentials.slot_dir(id) if as_array else Credentials.png_path(id)
+			_import_profiles[dest] = profile
+			slots.append({
+				"id": id,
+				"kind": "record_field",
+				"intent": field.intent,
+				"label": _clip("%s/%s.%s" % [label, record_key, field.key], 255),
+				"path": dest,
+				"localHash": _bundle_hash(dest) if as_array else _local_hash(dest),
+				"set_path": path,
+				"record_id": record.id,
+				"field_key": field.key,
+			})
+			seen[id] = true
+
+	slots.append({
+		"id": res.id,
+		"kind": "collection",
+		"path": path,
+		"collection": {
+			"id": res.id,
+			"label": _clip(label, 255),
+			"path": path,
+			"fields": fields,
+			"records": records,
+		},
+	})
 
 
 func _node_slot(
@@ -993,14 +1331,14 @@ func _bundle_hash(path: String) -> Variant:
 	return digest
 
 
-func _looks_like_set(path: String) -> bool:
+func _looks_like(path: String, type_name: String) -> bool:
 	if path.ends_with(".res"):
 		return true
 	var file := FileAccess.open(path, FileAccess.READ)
 	if file == null:
 		return false
 	var head := file.get_buffer(mini(file.get_length(), 2048)).get_string_from_utf8()
-	return "SpriteBenchSet" in head
+	return type_name in head
 
 
 func _walk(path: String, suffixes: Array[String]) -> PackedStringArray:
