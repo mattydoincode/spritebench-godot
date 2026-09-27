@@ -295,7 +295,7 @@ func _push_catalog(slots: Array[Dictionary]) -> Dictionary:
 			collections.append(slot.collection)
 	var response: Dictionary = await _api.post_json(
 		"/api/v1/projects/%s/slots" % Credentials.project_id(),
-		{"slots": payload, "collections": collections}
+		{"slots": payload, "collections": collections, "lane": Credentials.art()}
 	)
 	if not response.ok:
 		_set_status(response.error)

@@ -32,4 +32,13 @@ ln -s /path/to/spritebench-godot/addons/spritebench res://addons/spritebench
 - Records can be added, renamed and deleted in SpriteBench as well as in Godot. The next sync adds, renames or removes them in the `.tres`, then pulls their art.
 - Slot ids are derived from the record id and field key (`Hasher.field_slot_id`), so a record created in SpriteBench can take art before Godot has seen it.
 
+## Prototype and final art
+
+Every slot can hold two sets of art in SpriteBench: the AI **prototype** and an artist's **final**. Project Settings → SpriteBench → **Art** picks what the game pulls:
+
+- `final` (default): each slot's final where it has one, otherwise its prototype.
+- `prototype`: only prototypes, for comparing or playtesting before the art is done.
+
+It is a project setting (committed), so the team and every build agree. Changing it takes effect on the next sync; game code does not change, since each slot keeps its file path.
+
 Godot never uploads pixels. Assign art in the SpriteBench Engine panel. Editing a pulled PNG in Godot sticks until you assign again; the web app shows "edited in Godot".
