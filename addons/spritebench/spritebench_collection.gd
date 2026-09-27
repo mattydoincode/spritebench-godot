@@ -3,7 +3,8 @@ class_name SpriteBenchCollection
 extends Resource
 
 ## A table of keyed records with named art fields, synced with SpriteBench.
-## Godot owns `fields`; records can be added, renamed or deleted from either
+## A table made in Godot owns its `fields`; one made in SpriteBench takes its
+## fields from there. Records can be added, renamed or deleted from either
 ## side. Each (record, field) is its own SpriteBench slot.
 
 @export_storage var id: String = ""

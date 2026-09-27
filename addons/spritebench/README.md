@@ -32,6 +32,15 @@ ln -s /path/to/spritebench-godot/addons/spritebench res://addons/spritebench
 - Records can be added, renamed and deleted in SpriteBench as well as in Godot. The next sync adds, renames or removes them in the `.tres`, then pulls their art.
 - Slot ids are derived from the record id and field key (`Hasher.field_slot_id`), so a record created in SpriteBench can take art before Godot has seen it.
 
+## Made in SpriteBench
+
+Assets, lists and tables can also be created in SpriteBench (Game Assets → + new), for projects designed there first:
+
+- Standalone **assets** and **lists** go into `res://spritebench/assets.tres`, a `SpriteBenchSet`: `load("res://spritebench/assets.tres").get_texture(&"hero_idle")`, or `get_textures(&"rock_variants")` for a list. SpriteBench manages that file, so keep your own sets in other files.
+- **Tables** become `res://spritebench/tables/<name>.tres` (`SpriteBenchCollection`) with SpriteBench's fields. Rows and art sync like any other collection.
+
+Remove these in SpriteBench; the next sync takes them out of `assets.tres`. A removed table's `.tres` is left in place.
+
 ## Prototype and final art
 
 Every slot can hold two sets of art in SpriteBench: the AI **prototype** and an artist's **final**. Project Settings → SpriteBench → **Art** picks what the game pulls:

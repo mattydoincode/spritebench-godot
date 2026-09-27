@@ -239,9 +239,13 @@ func _sync() -> void:
 		_set_busy(false)
 		return
 
-	# Records added, renamed or deleted in SpriteBench land in the resources
-	# first, so the pull below has a local slot to assign each field into.
-	var changed := _apply_collections(catalog.get("collections", []))
+	# Assets, lists and tables made in SpriteBench become resources first, then
+	# records added, renamed or deleted there land in them, so the pull below
+	# has a local slot to assign each field into.
+	var made := _apply_web_assets(catalog)
+	if made > 0:
+		_log_line("wrote %s changes from SpriteBench-made assets" % made)
+	var changed := made + _apply_collections(catalog.get("collections", []))
 	if changed > 0:
 		_log_line("updated %s records from SpriteBench" % changed)
 		slots = _collect_slots()
@@ -350,6 +354,115 @@ func _apply_collections(rows: Array) -> int:
 			_save(collection, path)
 			changed += dirty
 	return changed
+
+
+## Writes what was made in SpriteBench into the project: standalone assets and
+## lists into `assets.tres` (a SpriteBenchSet that SpriteBench manages), and
+## each SpriteBench-made table into `tables/<name>.tres` with SpriteBench's
+## name and fields. Returns how many things changed.
+func _apply_web_assets(catalog: Dictionary) -> int:
+	var changed := 0
+	var dir := Credentials.output_dir()
+	var web_slots: Array = []
+	for row in catalog.get("slots", []):
+		if typeof(row) != TYPE_DICTIONARY or str(row.get("origin", "")) != "web":
+			continue
+		var kind := str(row.get("kind", ""))
+		if kind == "set_item" or kind == "set_bag":
+			web_slots.append(row)
+	var assets_path := dir.path_join("assets.tres")
+	if not web_slots.is_empty() or ResourceLoader.exists(assets_path):
+		changed += _sync_assets_set(assets_path, web_slots)
+	var paths := _collection_paths()
+	for row in catalog.get("collections", []):
+		if typeof(row) == TYPE_DICTIONARY and str(row.get("origin", "")) == "web":
+			changed += _sync_web_table(row, paths, dir)
+	return changed
+
+
+func _sync_assets_set(path: String, rows: Array) -> int:
+	var set_res: SpriteBenchSet
+	if ResourceLoader.exists(path):
+		var loaded := ResourceLoader.load(path)
+		if not loaded is SpriteBenchSet:
+			_log_line("%s is not a SpriteBenchSet; leaving it alone" % path)
+			return 0
+		set_res = loaded as SpriteBenchSet
+	else:
+		set_res = SpriteBenchSet.new()
+	var wanted := {}
+	var dirty := 0
+	for row in rows:
+		var id := str(row.get("id", ""))
+		var key := StringName(str(row.get("label", "")))
+		var list := str(row.get("kind", "")) == "set_bag"
+		wanted[id] = true
+		var item: SpriteBenchItem = null
+		for existing in set_res.items:
+			if existing and existing.slot_id == id:
+				item = existing
+				break
+		if item == null:
+			item = SpriteBenchItem.new()
+			item.slot_id = id
+			item.key = key
+			item.as_array = list
+			set_res.items.append(item)
+			_log_line("added %s to assets.tres" % key)
+			dirty += 1
+		elif item.key != key or item.as_array != list:
+			item.key = key
+			item.as_array = list
+			dirty += 1
+	# SpriteBench manages this file: anything it no longer lists goes.
+	for existing in set_res.items.duplicate():
+		if existing and not wanted.has(existing.slot_id):
+			set_res.items.erase(existing)
+			_log_line("removed %s from assets.tres" % existing.key)
+			dirty += 1
+	if dirty > 0:
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(path.get_base_dir()))
+		_save(set_res, path)
+	return dirty
+
+
+func _sync_web_table(row: Dictionary, paths: Dictionary, dir: String) -> int:
+	var id := str(row.get("id", ""))
+	var label := str(row.get("label", "table"))
+	var path := str(paths.get(id, ""))
+	var collection: SpriteBenchCollection
+	var dirty := 0
+	if path.is_empty():
+		path = dir.path_join("tables").path_join("%s.tres" % label)
+		collection = SpriteBenchCollection.new()
+		collection.id = id
+		_log_line("created %s" % path.get_file())
+		dirty += 1
+	else:
+		collection = ResourceLoader.load(path) as SpriteBenchCollection
+		if collection == null:
+			return 0
+	if collection.label != label:
+		collection.label = label
+		dirty += 1
+	var incoming: Array = row.get("fields", [])
+	var same := collection.fields.size() == incoming.size()
+	var fields: Array[SpriteBenchField] = []
+	for i in incoming.size():
+		var field := SpriteBenchField.new()
+		field.key = StringName(str(incoming[i].get("key", "")))
+		field.as_array = str(incoming[i].get("intent", "")) == "textures"
+		fields.append(field)
+		var current := collection.fields[i] if same else null
+		if same and (current == null or current.key != field.key or current.as_array != field.as_array):
+			same = false
+	if not same:
+		collection.fields = fields
+		dirty += 1
+	if dirty > 0:
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(path.get_base_dir()))
+		_save(collection, path)
+	return dirty
 
 
 func _collection_paths() -> Dictionary:
