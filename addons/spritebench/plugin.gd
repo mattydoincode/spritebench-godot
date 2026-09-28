@@ -124,7 +124,7 @@ func _build_dock() -> Control:
 
 	_status = Label.new()
 	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_status.text = "Paste a PAT from SpriteBench Settings."
+	_status.text = "Paste a personal access token from SpriteBench: Settings → Account & keys."
 	col.add_child(_status)
 
 	_log = TextEdit.new()
